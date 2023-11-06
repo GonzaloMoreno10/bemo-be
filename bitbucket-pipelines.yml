@@ -1,0 +1,158 @@
+image: google/cloud-sdk:alpine
+options:
+  max-time: 30
+definitions:
+  services:
+    docker:
+      memory: 2560
+  steps:
+    - step: &build-and-push
+        image: atlassian/default-image:3
+        name: Build and push docker image
+        script:
+          - if ! [ $DOCKER_TAG == "latest" ]; then echo "Skipping step"; exit 0; fi
+          - docker login --username $DOCKER_USER --password $DOCKER_PASS
+          - docker build -t $DOCKER_IMAGE:latest .
+          - docker push $DOCKER_IMAGE:latest
+          - docker build -t $DOCKER_IMAGE:$BITBUCKET_BUILD_NUMBER .
+          - docker push $DOCKER_IMAGE:$BITBUCKET_BUILD_NUMBER
+        caches:
+          - docker
+        services:
+          - docker
+    - step: &set-environment
+        name: Set environment (development)
+        script:
+          - echo $GCLOUD_API_KEYFILE_DEVELOPMENT | base64 -d > .gcloud.gcloud-api-key.json
+          - echo "autocity-development" > .gcloud.project-id
+          - echo "development-in-meta4" > .gcloud.deployment-type
+        artifacts:
+          - .gcloud.gcloud-api-key.json
+          - .gcloud.project-id
+          - .gcloud.deployment-type
+    - step: &get-env-secret-manager
+        name: Get env from Secret Manager
+        script:
+          - gcloud auth activate-service-account --key-file .gcloud.gcloud-api-key.json
+          - gcloud config set project $(cat .gcloud.project-id)
+          - true > .env
+          - >
+            for i in $(gcloud secrets list --filter="labels.release ~ null$ AND labels.component ~ ${DOCKER_COMPOSE_SERVICE_NAME}$" --format="value(name)"); do
+              VARIABLE_NAME=$(echo $i | sed "s/^${DOCKER_COMPOSE_SERVICE_NAME}-//g")
+              echo "${VARIABLE_NAME}=\"$(gcloud secrets versions access latest --secret=$i)\"" >> .env
+            done
+        artifacts:
+          - .env
+    - step: &deploy
+        name: Deploy
+        script:
+          - gcloud auth activate-service-account --key-file .gcloud.gcloud-api-key.json
+          - gcloud config set project $(cat .gcloud.project-id)
+          - gcloud compute instances list --filter="labels.in-meta4:true" --format="value(name,zone)" > $BITBUCKET_CLONE_DIR/.gcloud.hosts
+          - >
+            if [ $(cat .gcloud.deployment-type) == "development-in-meta4" ]; then
+              DOCKER_CENTRAL_BUCKET=${DOCKER_CENTRAL_BUCKET_DEVELOPMENT}
+              gsutil cp -r ${DOCKER_CENTRAL_BUCKET}/docker-compose-$(cat .gcloud.deployment-type).yaml docker-compose.yaml
+              if ! [ $DOCKER_TAG == "latest" ]; then
+                sed -i "s;$DOCKER_IMAGE;$DOCKER_IMAGE:$DOCKER_TAG;g" $BITBUCKET_CLONE_DIR/docker-compose.yaml
+              fi 
+            elif [ $(cat .gcloud.deployment-type) == "testing-in-meta4" -o $(cat .gcloud.deployment-type) == "produccion-in-meta4" ]; then
+              case $(cat .gcloud.deployment-type) in
+                "testing-in-meta4")
+                  DOCKER_CENTRAL_BUCKET=${DOCKER_CENTRAL_BUCKET_TESTING}
+                  TYPE_VERSION=$(cat .gcloud.deployment-type)
+                  ;;
+                "produccion-in-meta4")
+                  DOCKER_CENTRAL_BUCKET=${DOCKER_CENTRAL_BUCKET_PRODUCCION}
+                  TYPE_VERSION=$(cat .gcloud.deployment-type)
+                  ;;
+                *)
+                  TYPE_VERSION=$(cat .gcloud.deployment-type)
+                  ;;
+              esac                     
+              while : ; do
+                if ! [[ $(gsutil ls ${DOCKER_CENTRAL_BUCKET}/docker-compose-${TYPE_VERSION}.yaml.lock) ]]; then
+                  echo "* COMPOSE LOCK: didn't find compose lock file. Uploading it."
+                  echo "${DOCKER_COMPOSE_SERVICE_NAME}" > dc.lock
+                  gsutil cp -r dc.lock ${DOCKER_CENTRAL_BUCKET}/docker-compose-${TYPE_VERSION}.yaml.lock
+                fi
+                rm dc.lock 2&>1 || true
+                echo "* COMPOSE LOCK: getting compose lock file."
+                gsutil cp -r ${DOCKER_CENTRAL_BUCKET}/docker-compose-${TYPE_VERSION}.yaml.lock dc.lock || true
+                if [[ -f dc.lock ]]; then
+                  if [[ "$(cat dc.lock)" == "${DOCKER_COMPOSE_SERVICE_NAME}" ]]; then
+                    echo "* COMPOSE LOCK: I got the lock, rewriting and uploading compose file"
+                    gsutil cp -r ${DOCKER_CENTRAL_BUCKET}/docker-compose-${TYPE_VERSION}.yaml docker-compose.yaml
+                    if [ $(cat .gcloud.deployment-type) == "testing-in-meta4" ]; then
+                      sed -i "s;$DOCKER_IMAGE.*;$DOCKER_IMAGE:$BITBUCKET_BUILD_NUMBER;g" $BITBUCKET_CLONE_DIR/docker-compose.yaml
+                    elif [ $(cat .gcloud.deployment-type) == "produccion-in-meta4" ]; then
+                      sed -i "s;$DOCKER_IMAGE.*;$DOCKER_IMAGE:$BITBUCKET_BUILD_NUMBER;g" $BITBUCKET_CLONE_DIR/docker-compose.yaml
+                    fi
+                    gsutil cp -r docker-compose.yaml ${DOCKER_CENTRAL_BUCKET}/docker-compose-${TYPE_VERSION}.yaml
+                    gsutil rm ${DOCKER_CENTRAL_BUCKET}/docker-compose-${TYPE_VERSION}.yaml.lock
+                    break
+                  else
+                    echo "* COMPOSE LOCK: waiting for compose file to be unlocked... taken by $(cat dc.lock)"
+                    sleep 20
+                  fi
+                else
+                  echo "* COMPOSE LOCK: couldn't get lock file, retrying"
+                  sleep 20
+                fi
+              done
+            fi
+          - >
+            while IFS= read -r line; do
+              GCE_HOST_NAME=$(echo $line | awk '{ print $1 }')
+              GCE_HOST_ZONE=$(echo $line | awk '{ print $2 }')
+              gcloud compute scp $BITBUCKET_CLONE_DIR/docker-compose.yaml ${GCE_HOST_NAME}:/root/docker-compose.yaml --zone ${GCE_HOST_ZONE} < /dev/null   
+              gcloud compute scp $BITBUCKET_CLONE_DIR/.env ${GCE_HOST_NAME}:/root/${DOCKER_COMPOSE_SERVICE_NAME}.env --zone ${GCE_HOST_ZONE} < /dev/null  
+              gcloud compute ssh ${GCE_HOST_NAME} --zone ${GCE_HOST_ZONE} --command="sudo docker network create in-meta4-network || true" < /dev/null
+              gcloud compute ssh ${GCE_HOST_NAME} --zone ${GCE_HOST_ZONE} --command="sudo docker volume create in-meta4-volume" < /dev/null              
+              gcloud compute ssh ${GCE_HOST_NAME} --zone ${GCE_HOST_ZONE} --command="sudo docker run -v in-meta4-volume:/environment --name helper-${DOCKER_COMPOSE_SERVICE_NAME} busybox true && sudo docker cp /root/${DOCKER_COMPOSE_SERVICE_NAME}.env helper-${DOCKER_COMPOSE_SERVICE_NAME}:/environment/${DOCKER_COMPOSE_SERVICE_NAME}.env && sudo docker rm helper-${DOCKER_COMPOSE_SERVICE_NAME}" < /dev/null
+              gcloud compute ssh ${GCE_HOST_NAME} --zone ${GCE_HOST_ZONE} --command="sudo docker login --username $DOCKER_USER --password $DOCKER_PASS" < /dev/null
+              gcloud compute ssh ${GCE_HOST_NAME} --zone ${GCE_HOST_ZONE} --command="sudo docker-compose -f /root/docker-compose.yaml pull ${DOCKER_COMPOSE_SERVICE_NAME}" < /dev/null
+              gcloud compute ssh ${GCE_HOST_NAME} --zone ${GCE_HOST_ZONE} --command="sudo docker-compose -f /root/docker-compose.yaml --project-name in-meta4 up -d ${DOCKER_COMPOSE_SERVICE_NAME}" < /dev/null
+              gcloud compute ssh ${GCE_HOST_NAME} --zone ${GCE_HOST_ZONE} --command="sudo docker image prune -a --force || true" < /dev/null
+            done < $BITBUCKET_CLONE_DIR/.gcloud.hosts
+        artifacts:
+          - .gcloud.hosts
+pipelines:
+  branches:
+    development:
+      - step: *build-and-push
+      # deploy in Development (automatic):
+      - step: *set-environment
+      - step: *get-env-secret-manager
+      - step:
+          <<: *deploy
+          deployment: development
+    develop:
+      - step: *build-and-push
+      # deploy in Testing (automatic):
+      - step:
+          <<: *set-environment
+          name: Set environment (testing)
+          script:
+            - echo $GCLOUD_API_KEYFILE_TESTING | base64 -d > .gcloud.gcloud-api-key.json
+            - echo "autocity-testing" > .gcloud.project-id
+            - echo "testing-in-meta4" > .gcloud.deployment-type
+      - step: *get-env-secret-manager
+      - step:
+          <<: *deploy
+          deployment: testing
+    main:
+      - step: *build-and-push
+      # deploy in Production (manual):
+      - step:
+          <<: *set-environment
+          name: Set environment (produccion)
+          trigger: manual
+          script:
+            - echo $GCLOUD_API_KEYFILE_PRODUCCION | base64 -d > .gcloud.gcloud-api-key.json
+            - echo "sistemas-soporte" > .gcloud.project-id
+            - echo "produccion-in-meta4" > .gcloud.deployment-type
+      - step: *get-env-secret-manager
+      - step:
+          <<: *deploy
+          deployment: produccion
