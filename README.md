@@ -8,7 +8,7 @@
 
 # Instalacion
 
-- Descargar el proyecto a un directorio local in-holac.
+- Descargar el proyecto a un directorio local.
   Ej:
   git clone git clone git@gitlab.com:bemo-api/be.git
 - Una vez descargada la soluci�n instalar las dependencias, para ello ubicados en el directorio be ejecutar el siguiente comando.
@@ -17,4 +17,5 @@
 
 - Finalmente correr la API en con
 - npm start o npm run dev con nodemon
+- La documentacion se alojara en el endpoint /docs
 - Puerto: 3000
